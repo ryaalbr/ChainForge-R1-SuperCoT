@@ -2,9 +2,7 @@
 
 ![ChainForge](https://github.com/user-attachments/assets/5b6d4341-f632-41d5-9117-a82a9a4b983a)
 
-
-
-A multi-stage pipeline that integrates **DeepSeek Reasoner** for chain-of-thought data and **Qwen2.5** language models. Inspired by the [DeepSeek-R1 paper]([text]\(https://arxiv.org/pdf/2501.12948\)), it showcases:
+A multi-stage pipeline that integrates **DeepSeek Reasoner** for chain-of-thought data and **Qwen2.5** language models. Inspired by the [DeepSeek-R1 paper](https://arxiv.org/pdf/2501.12948), it showcases:
 
 1. **Cold-Start SFT** using CoT from DeepSeek
 2. **Reasoning-Oriented RL** (GRPO-like) for improved correctness
@@ -40,7 +38,7 @@ A multi-stage pipeline that integrates **DeepSeek Reasoner** for chain-of-though
 
 **R1 + Super CoT: ChainForge** follows the methodology of **DeepSeek-R1** to enhance a Qwen2.5 model's reasoning abilities via reinforcement learning (RL). We:
 
-1. Retrieve high-quality **chain-of-thought** (CoT) from DeepSeek Reasoner
+1. Retrieve high-quality **chain-of-thought** (CoT) from DeepSeek Reasoner's `reasoning_content`
 2. Use it for a "cold-start" **supervised fine-tuning** (SFT)
 3. Conduct **Reasoning-Oriented RL** to boost correctness and clarity
 4. Utilize **rejection sampling** to pick the best RL outputs
@@ -53,11 +51,14 @@ A multi-stage pipeline that integrates **DeepSeek Reasoner** for chain-of-though
 
 ## Features
 
-* **DeepSeek Reasoner Integration**: Automates CoT collection via `reasoning_content`.
-* **Qwen2.5-7B** Base Model: Hugging Face model with RoPE and large context support.
-* **Group-based RL**: A GRPO-like approach for stable reinforcement training.
-* **Rejection Sampling**: Extracts best RL completions for further SFT.
-* **Distillation**: Compress final RL knowledge into smaller Qwen2.5 variants.
+* **DeepSeek Reasoner Integration**:
+  * Automates CoT collection via `reasoning_content`
+  * Properly handles <think> tags in chain-of-thought
+  * Maintains clean conversation history without reasoning feedback
+* **Qwen2.5-7B** Base Model: Hugging Face model with RoPE and large context support
+* **Group-based RL**: A GRPO-like approach for stable reinforcement training
+* **Rejection Sampling**: Extracts best RL completions for further SFT
+* **Distillation**: Compress final RL knowledge into smaller Qwen2.5 variants
 
 ***
 
@@ -92,8 +93,9 @@ A multi-stage pipeline that integrates **DeepSeek Reasoner** for chain-of-though
 ### Key Components
 
 1. **DeepSeek Integration** (`gather_cot_data_from_deepseek`):
-   * Automated CoT collection
-   * Structured reasoning format
+   * Automated CoT collection using `reasoning_content`
+   * Proper handling of <think> tags
+   * Clean conversation history management
    * Error handling and fallbacks
 
 2. **Dataset Classes**:
@@ -146,6 +148,35 @@ deepseek_prompts = [
 ]
 ```
 
+#### DeepSeek API Usage
+
+Important notes for using DeepSeek Reasoner:
+
+1. **Handling `reasoning_content`**:
+   ```python
+   # Extract both reasoning and final answer
+   reasoning_cot = choice.reasoning_content  # Contains <think> tags
+   final_text = choice.content  # Final answer only
+
+   # Never feed reasoning_content back into conversation
+   messages.append({"role": "assistant", "content": final_text})
+   ```
+
+2. **Supported Parameters**:
+   ```python
+   # Only use these parameters
+   response = openai.ChatCompletion.create(
+       model="deepseek-reasoner",
+       messages=messages,
+       max_tokens=1024
+   )
+   ```
+
+3. **Conversation History**:
+   * Only append final answers (`content`)
+   * Never include `reasoning_content` in history
+   * Keep track of turns properly
+
 #### Hyperparameter Tuning
 
 Key parameters to adjust:
@@ -176,18 +207,24 @@ rl_training_grpo(
 
 The pipeline begins by gathering high-quality chain-of-thought data from DeepSeek Reasoner:
 
-1. **Format**: Each response contains:
+1. **Response Format**:
    ```
    Question: {prompt}
    <reasoning_process>
-     Step-by-step logical deduction
+     <think>Step-by-step logical deduction</think>
    </reasoning_process>
    <summary>
      Final concise answer
    </summary>
    ```
 
-2. **Error Handling**:
+2. **API Integration**:
+   * Proper handling of `reasoning_content` with <think> tags
+   * Clean conversation history management
+   * Only supported parameters used
+   * No reasoning feedback in subsequent calls
+
+3. **Error Handling**:
    * API failures trigger fallback to mock data
    * Rate limiting protection
    * Response validation

@@ -73,26 +73,29 @@ def gather_cot_data_from_deepseek(
     openai.api_base = "https://api.deepseek.com"
 
     results = []
+    messages_history = []  # Track conversation history
 
     # Limit total API calls for demo/cost purposes
     n = min(len(prompts), max_samples)
 
     for i in range(n):
         user_prompt = prompts[i]
-        # Format messages for DeepSeek API
-        messages = [{"role": "user", "content": user_prompt}]
+        # Format messages for DeepSeek API - only include content, not reasoning
+        messages = messages_history + [{"role": "user", "content": user_prompt}]
 
         try:
-            # Call DeepSeek API
+            # Call DeepSeek API - only use supported parameters
             response = openai.ChatCompletion.create(
                 model=model_name,
                 messages=messages,
                 max_tokens=1024,  # Controls final answer length
             )
 
-            # Extract CoT and final answer
+            # Extract CoT (with <think> tags) and final answer
             choice = response.choices[0].message
-            reasoning_cot = choice.reasoning_content  # Chain-of-thought
+            reasoning_cot = (
+                choice.reasoning_content
+            )  # Chain-of-thought with <think> tags
             final_text = choice.content  # Final answer
 
             # Format into unified training format
@@ -102,6 +105,9 @@ def gather_cot_data_from_deepseek(
                 f"<summary>{final_text}</summary>"
             )
             results.append(single_text)
+
+            # Update conversation history with ONLY the final answer, not the reasoning
+            messages_history.append({"role": "assistant", "content": final_text})
 
         except Exception as e:
             print(f"DeepSeek API call failed for prompt='{user_prompt}': {e}")
