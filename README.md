@@ -1,5 +1,9 @@
 # R1 + Super CoT: ChainForge
 
+![ChainForge](https://github.com/user-attachments/assets/5b6d4341-f632-41d5-9117-a82a9a4b983a)
+
+
+
 A multi-stage pipeline that integrates **DeepSeek Reasoner** for chain-of-thought data and **Qwen2.5** language models. Inspired by the [DeepSeek-R1 paper]([text]\(https://arxiv.org/pdf/2501.12948\)), it showcases:
 
 1. **Cold-Start SFT** using CoT from DeepSeek
