@@ -55,15 +55,7 @@ The integration of Anthropic Claude adds a crucial layer of reasoning enhancemen
    * In rejection sampling phase
    * During final model distillation
 
-### 3. Performance Impact
-
-Based on our experiments with Claude-3.5-Sonnet:
-
-* 16.0% → 26.7% improvement on AIME 2024 consistency
-* Enhanced reasoning clarity in complex domains
-* Better handling of edge cases and ambiguous steps
-
-### 4. Implementation Details
+### 3. Implementation Details
 
 1. **API Integration**:
    ```python
