@@ -1,25 +1,34 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 """
-DeepSeek-R1 Style Pipeline with Qwen2.5 Integration
-=================================================
+DeepSeek-R1 Style Pipeline + Partial Anthropic Expansions
+=========================================================
 
-This pipeline implements a sophisticated training approach that:
-1. Gathers chain-of-thought (CoT) data from DeepSeek Reasoner
-2. Uses Qwen2.5-7B-Instruct as the base model for:
+This script demonstrates:
+1) Gathering chain-of-thought (CoT) from DeepSeek,
+2) Partially expanding "uncertain" or "tricky" steps via Anthropic,
+3) Feeding the resulting (CoT + partial expansions) into:
    - Supervised Fine-Tuning (SFT)
    - Reasoning-Oriented Reinforcement Learning (RL)
-   - Rejection Sampling
-   - Additional SFT
-   - Final RL stage
-   - Optional Knowledge Distillation
+   - Rejection Sampling + Additional SFT
+   - Final RL
+   - Optional Distillation
 
-Prerequisites:
--------------
-* pip install openai  # For DeepSeek API
-* pip install transformers>=4.37.0 accelerate sentencepiece  # For Qwen
-* Set DEEPSEEK_API_KEY in environment or code
+The approach is inspired by the multi-stage pipeline from the
+"DeepSeek-R1" paper, which organizes an LLM training flow as:
+
+  (a) Cold-Start SFT (often with a small set of chain-of-thought data)
+  (b) Reasoning-Focused RL (using well-defined tasks)
+  (c) Rejection Sampling + More SFT
+  (d) Final RL
+  (e) Optional Distillation
+
+References:
+-----------
+- DeepSeek-R1 paper: Introduces multi-stage RL for reasoning.
+- Qwen2.5: A family of LLMs from Qwen with instruct variants (7B, etc.).
+- Anthropic Claude: For expansions or "buddy critique."
+
+This script focuses on Qwen2.5-7B-Instruct as the base model, but in
+the comments we note how to adapt to other models (e.g., LLaMA, GPT2, etc.).
 
 Author: Nicolas W Schlaepfer
 License: MIT
@@ -33,10 +42,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-# For DeepSeek API calls
-import openai
+# External API clients
+import openai  # For DeepSeek
+import anthropic  # For Anthropic
 
-# For Qwen2.5 model and tokenizer
+# Transformers for Qwen and RL pipeline
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
@@ -44,70 +54,135 @@ from transformers import (
     get_linear_schedule_with_warmup,
 )
 
+###############################################################################
+# Step 0A: PARTIAL EXPANSION LOGIC
+###############################################################################
 
-def gather_cot_data_from_deepseek(
-    prompts, max_samples=10, model_name="deepseek-reasoner"
+
+def gather_data_deepseek_with_partial_anthropic(
+    prompts,
+    max_samples=10,
+    deepseek_model="deepseek-reasoner",
+    anthropic_model="claude-3-5-sonnet-20241022",
+    anthropic_max_tokens=512,
 ):
     """
-    Gather chain-of-thought (CoT) data from DeepSeek Reasoner API.
+    Gather chain-of-thought (CoT) from DeepSeek, then selectively call Anthropic
+    to expand the "uncertain" steps in that chain-of-thought.
 
-    This function:
-    1. Takes a list of prompts/questions
-    2. Calls DeepSeek Reasoner API for each
-    3. Extracts both reasoning (CoT) and final answer
-    4. Formats them into a unified training format
+    1) Query DeepSeek for each prompt. We get:
+       - chain-of-thought (with <think> tags) in choice.reasoning_content
+       - final answer in choice.content
 
-    Args:
-        prompts (List[str]): List of questions/prompts to get CoT for
-        max_samples (int): Maximum number of API calls to make
-        model_name (str): DeepSeek model to use
+    2) Parse the CoT into steps. We'll do something simple:
+       - Split by <think>...</think> blocks
+       - For each step, check if it "looks uncertain" by scanning for certain tokens
+         (e.g., "maybe", "not sure", "I guess").
+
+    3) If uncertain, call Anthropic to produce an expansion. Insert it as
+       <explanation> expansions </explanation> inside that step.
+
+    4) Combine everything into a single text string that looks like:
+
+       Question: ...
+       <reasoning_process> ... expansions ... </reasoning_process>
+       <summary> final answer </summary>
 
     Returns:
-        List[str]: List of formatted strings containing:
-                  "Question: {prompt}
-                   <reasoning_process>{cot}</reasoning_process>
-                   <summary>{answer}</summary>"
+        List of text strings, one per prompt. These can be used for SFT.
     """
-    # Ensure DeepSeek API key is set
-    openai.api_key = os.environ.get("DEEPSEEK_API_KEY", "YOUR_DEEPSEEK_KEY")
+
+    # (a) Setup DeepSeek credentials
+    deepseek_api_key = os.environ.get("DEEPSEEK_API_KEY", "YOUR_DEEPSEEK_KEY")
+    openai.api_key = deepseek_api_key
     openai.api_base = "https://api.deepseek.com"
 
-    results = []
-    messages_history = []  # Track conversation history
+    # (b) Setup Anthropic client
+    anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY", "YOUR_ANTHROPIC_KEY")
+    anthro_client = anthropic.Client(api_key=anthropic_api_key)
 
-    # Limit total API calls for demo/cost purposes
+    results = []
+    messages_history = []  # Track short conversation memory for deepseek
     n = min(len(prompts), max_samples)
 
     for i in range(n):
         user_prompt = prompts[i]
-        # Format messages for DeepSeek API - only include content, not reasoning
+        # For the DeepSeek call, we do a simple conversation with a single user message
         messages = messages_history + [{"role": "user", "content": user_prompt}]
 
         try:
-            # Call DeepSeek API - only use supported parameters
+            # 1) Call DeepSeek
             response = openai.ChatCompletion.create(
-                model=model_name,
+                model=deepseek_model,
                 messages=messages,
-                max_tokens=1024,  # Controls final answer length
+                max_tokens=1024,  # final answer length
             )
-
-            # Extract CoT (with <think> tags) and final answer
             choice = response.choices[0].message
-            reasoning_cot = (
-                choice.reasoning_content
-            )  # Chain-of-thought with <think> tags
-            final_text = choice.content  # Final answer
 
-            # Format into unified training format
+            # 2) Extract chain-of-thought and final
+            deepseek_cot = choice.reasoning_content  # e.g., <think> step1 </think> ...
+            final_answer = choice.content
+
+            # 3) Parse partial expansions
+            #    We'll split by </think>, then look for uncertain tokens
+            splitted = deepseek_cot.split("</think>")
+
+            reconstructed_cot = []
+            for chunk in splitted:
+                # chunk might contain something like "some text <think> step n..."
+                if "<think>" in chunk:
+                    sub_parts = chunk.split("<think>")
+                    # sub_parts[0] is text before <think>, sub_parts[1] is the "inside" text
+                    if len(sub_parts) == 2:
+                        # e.g. sub_parts = ["some text", "the actual reasoning step"]
+                        reasoning_text = sub_parts[1].strip()
+
+                        # Check if the step is "uncertain"
+                        if is_uncertain_step(reasoning_text):
+                            # We call Anthropic to produce an explanation
+                            expansion = call_anthropic_expansion(
+                                anthro_client,
+                                anthropic_model,
+                                reasoning_text,
+                                max_tokens=anthropic_max_tokens,
+                            )
+                            # embed it
+                            chunk_rebuilt = (
+                                f"<think>{reasoning_text}"
+                                f"\n<explanation>{expansion}</explanation></think>"
+                            )
+                        else:
+                            # If step is not uncertain, no expansions
+                            chunk_rebuilt = f"<think>{reasoning_text}</think>"
+
+                        # Optionally include whatever was before <think>, if not empty
+                        if sub_parts[0].strip():
+                            chunk_rebuilt = (
+                                sub_parts[0]
+                                + "<think>"
+                                + chunk_rebuilt[len("<think>") :]
+                            )
+                        reconstructed_cot.append(chunk_rebuilt)
+                    else:
+                        # fallback if parsing fails
+                        reconstructed_cot.append(chunk)
+                else:
+                    if chunk.strip():
+                        reconstructed_cot.append(chunk)
+
+            # Join them back
+            final_cot = "</think>".join(reconstructed_cot)
+
+            # 4) Format for training
             single_text = (
                 f"Question: {user_prompt}\n"
-                f"<reasoning_process>{reasoning_cot}</reasoning_process>\n"
-                f"<summary>{final_text}</summary>"
+                f"<reasoning_process>{final_cot}</reasoning_process>\n"
+                f"<summary>{final_answer}</summary>"
             )
             results.append(single_text)
 
-            # Update conversation history with ONLY the final answer, not the reasoning
-            messages_history.append({"role": "assistant", "content": final_text})
+            # Update conversation memory with final answer
+            messages_history.append({"role": "assistant", "content": final_answer})
 
         except Exception as e:
             print(f"DeepSeek API call failed for prompt='{user_prompt}': {e}")
@@ -116,60 +191,76 @@ def gather_cot_data_from_deepseek(
     return results
 
 
+def is_uncertain_step(text):
+    """
+    Simple heuristic for "uncertain" steps.
+    You can expand or refine this approach. If the chain-of-thought
+    contains any of these keywords, we call for expansions.
+    """
+    uncertain_tokens = ["maybe", "not sure", "guess", "uncertain", "unsure"]
+    # You can also check text length, punctuation, or domain-specific signals
+    for token in uncertain_tokens:
+        if token.lower() in text.lower():
+            return True
+    return False
+
+
+def call_anthropic_expansion(client, model_name, raw_thought, max_tokens=512):
+    """
+    Call Anthropic for a short expansion of 'raw_thought'.
+    We ask for partial/factual justification. In practice,
+    you might want to tune the prompt.
+    """
+    prompt_text = (
+        f"{anthropic.HUMAN_PROMPT}"
+        f"Please read the following reasoning step:\n"
+        f'"""{raw_thought}"""\n'
+        f"Then provide a brief, factual expansion or 'grounding' of why this step might be correct or relevant.\n"
+        f"{anthropic.AI_PROMPT}"
+    )
+
+    resp = client.completions.create(
+        model=model_name,
+        max_tokens_to_sample=max_tokens,
+        temperature=0.7,
+        top_p=0.9,
+        prompt=prompt_text,
+    )
+    return resp.completion.strip()
+
+
+###############################################################################
+# DATASET & TRAINING UTILS
+# (Adapted from the standard DeepSeek-R1 pipeline code)
+###############################################################################
+
+
 class ChainOfThoughtDataset(Dataset):
     """
-    PyTorch Dataset for Chain-of-Thought training data.
+    PyTorch Dataset that holds the chain-of-thought text samples.
 
-    This dataset handles:
-    1. Storing CoT text samples
-    2. Tokenization for model input
-    3. Proper padding and truncation
-    4. Batch collation
-
-    The expected format for each text is:
-    "Question: {question}
-     <reasoning_process>{cot}</reasoning_process>
-     <summary>{answer}</summary>"
+    If you want to adapt this pipeline for a different domain or different
+    model, you can:
+      - Provide your domain-specific text data.
+      - Possibly parse your data differently (e.g., if you store
+        the question/CoT/final-answer in a different format).
     """
 
     def __init__(self, texts, tokenizer, max_length=512):
-        """
-        Initialize the dataset.
-
-        Args:
-            texts (List[str]): List of formatted CoT texts
-            tokenizer: HuggingFace tokenizer (e.g., Qwen2.5 tokenizer)
-            max_length (int): Maximum sequence length for truncation
-        """
         super().__init__()
         self.texts = texts
         self.tokenizer = tokenizer
         self.max_length = max_length
 
     def __len__(self):
-        """Return the number of samples in the dataset."""
         return len(self.texts)
 
     def __getitem__(self, idx):
-        """Get a single text sample by index."""
         return self.texts[idx]
 
     def collate_fn(self, batch_texts):
-        """
-        Collate a batch of texts into model input format.
-
-        This function:
-        1. Tokenizes all texts in the batch
-        2. Applies padding to make all sequences same length
-        3. Truncates sequences that are too long
-        4. Returns tensors ready for model input
-
-        Args:
-            batch_texts (List[str]): Batch of text samples
-
-        Returns:
-            dict: Contains input_ids and attention_mask tensors
-        """
+        # We simply tokenize the entire text and treat it as a
+        # causal LM training sample
         return self.tokenizer(
             batch_texts,
             padding=True,
@@ -192,27 +283,16 @@ def supervised_fine_tune(
     device="cuda",
 ):
     """
-    Perform supervised fine-tuning (SFT) on the model using chain-of-thought data.
+    Perform Supervised Fine-Tuning (SFT) on chain-of-thought data.
 
-    This function:
-    1. Sets up training DataLoader
-    2. Configures optimizer and learning rate scheduler
-    3. Runs training loop with gradient updates
-    4. Saves the fine-tuned model
+    This roughly corresponds to the "Cold-Start SFT" or "additional SFT"
+    steps in the DeepSeek-R1 pipeline. You can adapt the hyperparameters
+    or the dataset to focus on specific tasks or domains.
 
-    Args:
-        model: HuggingFace model to fine-tune
-        tokenizer: Associated tokenizer
-        train_dataset: Dataset containing CoT samples
-        output_dir (str): Where to save the model
-        epochs (int): Number of training epochs
-        batch_size (int): Batch size for training
-        lr (float): Learning rate
-        warmup_ratio (float): Portion of steps for LR warmup
-        max_steps (int, optional): If set, override epochs
-        device (str): Device to train on ('cuda' or 'cpu')
+    If you want to use a different base model (e.g. LLaMA, GPT2):
+      - Just load that model & tokenizer
+      - Pass them here
     """
-    # Setup training dataloader
     train_loader = DataLoader(
         train_dataset,
         shuffle=True,
@@ -220,87 +300,71 @@ def supervised_fine_tune(
         collate_fn=train_dataset.collate_fn,
     )
 
-    # Move model to device and set to training mode
     model = model.to(device)
     model.train()
 
-    # Setup optimizer
     optimizer = AdamW(model.parameters(), lr=lr)
 
-    # Calculate total steps and warmup steps
     total_steps = len(train_loader) * epochs if max_steps is None else max_steps
     warmup_steps = int(total_steps * warmup_ratio)
-
-    # Setup learning rate scheduler
     scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
-    # Training loop
     global_step = 0
     for epoch in range(epochs):
         for batch in train_loader:
-            # Move batch to device
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
 
-            # Forward pass with loss calculation
             outputs = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                labels=input_ids,  # For causal LM, targets are inputs
+                labels=input_ids,
             )
             loss = outputs.loss
-
-            # Backward pass and optimization
             loss.backward()
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
 
-            # Progress tracking
             global_step += 1
             if global_step % 10 == 0:
                 print(f"[SFT] step={global_step}, loss={loss.item():.4f}")
 
-            # Early stopping if max_steps reached
+            # Early stop if max_steps is reached
             if max_steps and global_step >= max_steps:
                 break
 
         if max_steps and global_step >= max_steps:
             break
 
-    # Save the fine-tuned model and tokenizer
+    # Save your SFT checkpoint
     os.makedirs(output_dir, exist_ok=True)
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
     print(f"[SFT] Done. Model saved at {output_dir}")
 
 
+###############################################################################
+# MOCK RL DATASET (Simple arithmetic problems for demonstration)
+###############################################################################
+
+
 class MockRLReasoningDataset(Dataset):
     """
-    Mock dataset for RL training with simple arithmetic problems.
+    A toy dataset for RL. In real usage, you'd have domain-specific
+    tasks with a clear correctness checker or reward function.
 
-    This dataset generates pairs of:
-    - Questions: "Solve X + X = ?"
-    - Ground truth answers: "2X"
-
-    In real applications, replace this with your actual task dataset.
+    If you're focusing on a different domain (e.g. biology QA, finance),
+    you can create a custom dataset with your own 'question' and
+    'ground_truth' fields.
     """
 
     def __init__(self, tokenizer, num_samples=64, max_length=512):
-        """
-        Initialize the mock RL dataset.
-
-        Args:
-            tokenizer: HuggingFace tokenizer
-            num_samples (int): Number of mock samples to generate
-            max_length (int): Maximum sequence length
-        """
         super().__init__()
         self.tokenizer = tokenizer
         self.num_samples = num_samples
         self.max_length = max_length
 
-        # Generate mock question-answer pairs
         self.questions = []
         self.answers = []
         for i in range(num_samples):
@@ -310,62 +374,42 @@ class MockRLReasoningDataset(Dataset):
             self.answers.append(ground_truth)
 
     def __len__(self):
-        """Return the number of samples."""
         return self.num_samples
 
     def __getitem__(self, idx):
-        """Get a question-answer pair by index."""
         return {"question": self.questions[idx], "ground_truth": self.answers[idx]}
+
+
+###############################################################################
+# RL LOGIC (GRPO, akin to PPO but group-based)
+###############################################################################
 
 
 class GRPOTorchPolicy(nn.Module):
     """
-    Group-based Reward Policy Optimization (GRPO) implementation.
+    Group-based Reward Policy Optimization (GRPO) is introduced in
+    the DeepSeek-R1 pipeline. It's similar to PPO but uses group
+    advantage. For details, see the original DeepSeek-R1 paper
+    references.
 
-    This policy wrapper:
-    1. Handles the language model as a policy
-    2. Computes log probabilities for chosen tokens
-    3. Enables group-based advantage updates
-
-    The approach is similar to PPO but operates on groups of samples
-    rather than individual trajectories.
+    Typically:
+     1) We sample a "group" of responses for each question.
+     2) We compute advantage within that group by normalizing
+        each response's reward among them.
+     3) We apply a PPO-like clipped objective.
     """
 
     def __init__(self, model):
-        """
-        Initialize the GRPO policy.
-
-        Args:
-            model: Base language model to wrap
-        """
         super().__init__()
         self.model = model
 
     def forward(self, *args, **kwargs):
-        """Forward pass through the underlying model."""
         return self.model(*args, **kwargs)
 
     def log_probs_of_chosen_tokens(self, input_ids, attention_mask):
-        """
-        Compute log probabilities of chosen tokens.
-
-        This function:
-        1. Gets model logits
-        2. Applies softmax to get probabilities
-        3. Takes log of probabilities for chosen tokens
-
-        Args:
-            input_ids: Input token IDs
-            attention_mask: Attention mask for padding
-
-        Returns:
-            torch.Tensor: Log probabilities of chosen tokens
-        """
-        # Get model outputs
         out = self.model(input_ids=input_ids, attention_mask=attention_mask)
         logits = out.logits  # [batch, seq_len, vocab]
-
-        # Get last token logits and compute log probabilities
+        # We'll just get the last token for the "chosen" token
         last_logits = logits[:, -1, :]
         lp = F.log_softmax(last_logits, dim=-1)
         return lp
@@ -373,29 +417,18 @@ class GRPOTorchPolicy(nn.Module):
 
 def compute_reward(response_text, ground_truth):
     """
-    Compute reward for a model response.
+    A simple reward function for demonstration:
+      - +1 if ground_truth is in the response,
+      - +0.2 if it has <reasoning_process> and <summary> tags.
 
-    This simple reward function:
-    1. Gives +1 if ground truth appears in response
-    2. Gives +0.2 if response has proper reasoning format
-
-    Args:
-        response_text (str): Model's response text
-        ground_truth (str): Expected answer
-
-    Returns:
-        float: Computed reward value
+    In real usage, you'd define a domain-appropriate reward,
+    possibly hooking in partial correctness checks.
     """
     reward = 0.0
-
-    # Reward for proper reasoning format
     if "<reasoning_process>" in response_text and "<summary>" in response_text:
         reward += 0.2
-
-    # Reward for correct answer
     if ground_truth in response_text:
         reward += 1.0
-
     return reward
 
 
@@ -409,36 +442,19 @@ def sample_responses(
     max_new_tokens=128,
 ):
     """
-    Sample multiple responses from the model for a question.
+    Sample multiple responses from the policy. We do a simple prompt format.
+    Adjust this if your task or style differs.
 
-    This function:
-    1. Formats the question with chat template
-    2. Generates multiple responses with temperature
-    3. Returns list of response texts
-
-    Args:
-        model: Language model to sample from
-        tokenizer: Associated tokenizer
-        question (str): Input question
-        device (str): Device to run on
-        num_samples (int): Number of responses to generate
-        temperature (float): Sampling temperature
-        max_new_tokens (int): Maximum new tokens to generate
-
-    Returns:
-        List[str]: Generated response texts
+    If you're focusing on another domain or you need more advanced
+    prompting (like few-shot context), you can adapt the prompt here.
     """
     model.eval()
-
-    # Format with chat template
     system_prompt = "You are Qwen, a helpful assistant.\n"
     user_prompt = f"User: {question}\nAssistant:"
     text = system_prompt + user_prompt
 
-    # Encode prompt
     encoded_prompt = tokenizer.encode(text, return_tensors="pt").to(device)
 
-    # Generate multiple responses
     all_responses = []
     with torch.no_grad():
         for _ in range(num_samples):
@@ -450,7 +466,6 @@ def sample_responses(
                 top_p=0.95,
                 pad_token_id=tokenizer.eos_token_id,
             )
-            # Extract only the newly generated portion
             new_text = tokenizer.decode(
                 gen_ids[0][len(encoded_prompt[0]) :], skip_special_tokens=True
             )
@@ -471,36 +486,20 @@ def rl_training_grpo(
     kl_coeff=0.001,
 ):
     """
-    Train the model using Group-based Reward Policy Optimization (GRPO).
+    The RL training loop, following the GRPO approach from DeepSeek-R1.
 
-    This function:
-    1. Samples groups of responses for each question
-    2. Computes rewards and advantages
-    3. Updates policy using clipped objective
-    4. Applies KL penalty to stay close to reference
+    1) For each sample in the dataset, we gather 'group_size' responses.
+    2) Compute rewards and advantage
+    3) Update the policy with a clipped objective + KL penalty vs. a reference model
 
-    Args:
-        policy_model: GRPO policy to train
-        tokenizer: Associated tokenizer
-        rl_dataset: Dataset with questions and ground truths
-        num_rl_steps (int): Total training steps
-        group_size (int): Number of responses per question
-        device (str): Device to train on
-        lr (float): Learning rate
-        clip_ratio (float): PPO clip ratio
-        kl_coeff (float): KL penalty coefficient
-
-    Returns:
-        nn.Module: Trained language model
+    This loop is a direct analog to the Stage 2 and Stage 4 RL steps
+    described in the DeepSeek-R1 pipeline.
     """
-    # Setup policy for training
     policy_model = policy_model.to(device)
     policy_model.train()
-
-    # Setup optimizer
     optimizer = AdamW(policy_model.parameters(), lr=lr)
 
-    # Load reference model for KL penalty
+    # Reference model (for KL term) - same architecture
     ref_model = AutoModelForCausalLM.from_pretrained(
         "Qwen/Qwen2.5-7B-Instruct", torch_dtype="auto"
     ).to(device)
@@ -508,19 +507,16 @@ def rl_training_grpo(
     for p in ref_model.parameters():
         p.requires_grad_(False)
 
-    # Training loop
     step_count = 0
     data_indices = list(range(len(rl_dataset)))
     random.shuffle(data_indices)
 
     while step_count < num_rl_steps:
         for idx in data_indices:
-            # Get question and ground truth
             sample = rl_dataset[idx]
             question = sample["question"]
             ground_truth = sample["ground_truth"]
 
-            # Sample responses from current policy
             with torch.no_grad():
                 responses = sample_responses(
                     policy_model.model,
@@ -530,7 +526,7 @@ def rl_training_grpo(
                     num_samples=group_size,
                 )
 
-            # Compute rewards and advantages
+            # compute rewards and group advantage
             rewards = [compute_reward(r, ground_truth) for r in responses]
             mean_r = sum(rewards) / len(rewards)
             std_r = max(
@@ -538,28 +534,25 @@ def rl_training_grpo(
             )
             advantages = [(r - mean_r) / std_r for r in rewards]
 
-            # Update policy for each response in group
+            # Update for each response in the group
             for g_idx in range(group_size):
                 resp_text = responses[g_idx]
                 adv = advantages[g_idx]
 
-                # Skip empty responses
                 if not resp_text:
                     continue
 
-                # Format full conversation
+                # Build an input to measure log prob
                 new_input = f"User: {question}\nAssistant: {resp_text}"
-
-                # Get token probabilities
                 enc = tokenizer.encode(new_input, return_tensors="pt").to(device)
                 policy_lp = policy_model.log_probs_of_chosen_tokens(enc, None)
 
+                # Compare to reference
                 with torch.no_grad():
                     ref_out = ref_model(enc)
                     ref_logits = ref_out.logits[:, -1, :]
                     ref_lp = F.log_softmax(ref_logits, dim=-1)
 
-                # Get probability ratio
                 last_char = resp_text[-1]
                 tid = tokenizer.convert_tokens_to_ids(last_char)
                 if tid is None:
@@ -569,21 +562,19 @@ def rl_training_grpo(
                 ref_lp = ref_lp[0, tid]
                 ratio = torch.exp(pol_lp - ref_lp)
 
-                # Compute losses
+                # PPO clipped objective
                 surr1 = ratio * adv
                 surr2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * adv
                 policy_loss = -torch.min(surr1, surr2)
 
-                # Add KL penalty
+                # KL penalty
                 kl_penalty = kl_coeff * (pol_lp - ref_lp)
                 total_loss = policy_loss + kl_penalty
 
-                # Update policy
                 total_loss.backward()
                 optimizer.step()
                 optimizer.zero_grad()
 
-                # Progress tracking
                 step_count += 1
                 if step_count % 10 == 0:
                     print(
@@ -605,42 +596,33 @@ def rl_training_grpo(
     return policy_model.model
 
 
+###############################################################################
+# REJECTION SAMPLING & ADDITIONAL SFT
+###############################################################################
+
+
 def rejection_sampling_data_gen(
     rl_model, tokenizer, dataset, device="cuda", num_samples=4, accept_threshold=0.5
 ):
     """
-    Generate additional training data using rejection sampling.
+    After RL, we generate new data by sampling multiple responses
+    per question, picking the best (above accept_threshold reward),
+    and store them for additional SFT.
 
-    This function:
-    1. Samples multiple responses for each question
-    2. Keeps only high-reward responses
-    3. Formats them for additional SFT
-
-    Args:
-        rl_model: Trained RL model to sample from
-        tokenizer: Associated tokenizer
-        dataset: Dataset with questions and ground truths
-        device (str): Device to run on
-        num_samples (int): Responses to sample per question
-        accept_threshold (float): Minimum reward to accept
-
-    Returns:
-        List[str]: New training examples
+    This is directly from the DeepSeek-R1 pipeline Stage 3 approach.
+    If your domain has a more nuanced reward function, adapt 'compute_reward()'.
     """
     new_data = []
 
     for i in range(len(dataset)):
-        # Get question and ground truth
         item = dataset[i]
         question = item["question"]
         gt = item["ground_truth"]
 
-        # Sample candidate responses
         candidates = sample_responses(
             rl_model, tokenizer, question, device=device, num_samples=num_samples
         )
 
-        # Find best response by reward
         best_resp = None
         best_r = float("-inf")
         for resp in candidates:
@@ -649,7 +631,7 @@ def rejection_sampling_data_gen(
                 best_r = r
                 best_resp = resp
 
-        # Keep if above threshold
+        # accept if above threshold
         if best_r >= accept_threshold and best_resp:
             new_text = f"{question}\n{best_resp}"
             new_data.append(new_text)
@@ -659,44 +641,25 @@ def rejection_sampling_data_gen(
 
 class AdditionalSFTDataset(Dataset):
     """
-    Dataset for additional SFT using rejection sampled data.
-
-    Similar to ChainOfThoughtDataset but for the
-    additional training phase after RL.
+    A simpler dataset class for the new SFT data we get from
+    rejection sampling. Each sample is basically "question + answer"
+    in plain text. The collate_fn is similar to ChainOfThoughtDataset,
+    but here we do not forcibly parse <reasoning_process>.
     """
 
     def __init__(self, texts, tokenizer, max_len=512):
-        """
-        Initialize dataset.
-
-        Args:
-            texts (List[str]): Training texts
-            tokenizer: HuggingFace tokenizer
-            max_len (int): Maximum sequence length
-        """
         super().__init__()
         self.texts = texts
         self.tokenizer = tokenizer
         self.max_len = max_len
 
     def __len__(self):
-        """Return number of samples."""
         return len(self.texts)
 
     def __getitem__(self, idx):
-        """Get a single text sample."""
         return self.texts[idx]
 
     def collate_fn(self, batch_texts):
-        """
-        Collate batch of texts into model inputs.
-
-        Args:
-            batch_texts (List[str]): Batch of texts
-
-        Returns:
-            dict: Contains input_ids and attention_mask
-        """
         return self.tokenizer(
             batch_texts,
             padding=True,
@@ -704,6 +667,11 @@ class AdditionalSFTDataset(Dataset):
             max_length=self.max_len,
             return_tensors="pt",
         )
+
+
+###############################################################################
+# DISTILLATION
+###############################################################################
 
 
 def distill_reasoning(
@@ -717,27 +685,19 @@ def distill_reasoning(
     lr=1e-5,
 ):
     """
-    Distill the teacher model's knowledge into a smaller student.
+    An optional stage that distills the final RL model's knowledge
+    into a smaller (or same-size) student model.
 
-    This function:
-    1. Loads a smaller Qwen2.5 variant as student
-    2. Generates teacher outputs on dataset
-    3. Trains student to match teacher behavior
+    For example, you might want to distill a 7B teacher into a 3B or 1.5B
+    model. Just replace base_student_ckpt with the smaller variant.
 
-    Args:
-        teacher_model: Trained teacher model
-        tokenizer: Associated tokenizer
-        base_student_ckpt (str): Student model checkpoint
-        dataset_texts (List[str]): Training texts
-        output_dir (str): Where to save student
-        device (str): Device to use
-        epochs (int): Training epochs
-        lr (float): Learning rate
+    We simply:
+    1) Generate teacher outputs for each sample in dataset_texts
+    2) Fine-tune the student to match them
 
-    Returns:
-        nn.Module: Trained student model
+    This is the final stage in the DeepSeek-R1 pipeline.
     """
-    # Load student model
+    # Load the student model
     student = AutoModelForCausalLM.from_pretrained(
         base_student_ckpt, torch_dtype="auto"
     ).to(device)
@@ -748,15 +708,15 @@ def distill_reasoning(
     teacher_texts = []
     with torch.no_grad():
         for raw_prompt in dataset_texts:
-            # Get teacher's response
             enc = tokenizer.encode(raw_prompt, return_tensors="pt").to(device)
             out_ids = teacher_model.generate(enc, max_new_tokens=128)
             new_text = tokenizer.decode(out_ids[0], skip_special_tokens=True)
             teacher_texts.append(new_text)
 
-    # Create distillation dataset
+    # Build a dataset from these teacher outputs
     class DistillDataset(Dataset):
         def __init__(self, texts, tokenizer, max_len=512):
+            super().__init__()
             self.texts = texts
             self.tokenizer = tokenizer
             self.max_len = max_len
@@ -776,39 +736,31 @@ def distill_reasoning(
                 return_tensors="pt",
             )
 
-    # Setup training
     distill_ds = DistillDataset(teacher_texts, tokenizer)
     distill_loader = DataLoader(
         distill_ds, batch_size=2, shuffle=True, collate_fn=distill_ds.collate_fn
     )
 
-    # Train student
+    # Train the student
     optimizer = AdamW(student.parameters(), lr=lr)
     global_step = 0
 
     for epoch in range(epochs):
         for batch in distill_loader:
-            # Get inputs
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
-
-            # Forward pass and loss
             outputs = student(
                 input_ids=input_ids, attention_mask=attention_mask, labels=input_ids
             )
             loss = outputs.loss
-
-            # Update student
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
 
-            # Progress tracking
             global_step += 1
             if global_step % 10 == 0:
                 print(f"[Distill] step={global_step}, loss={loss.item():.4f}")
 
-    # Save student model
     os.makedirs(output_dir, exist_ok=True)
     student.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
@@ -817,41 +769,62 @@ def distill_reasoning(
     return student
 
 
+###############################################################################
+# MAIN PIPELINE
+###############################################################################
+
+
 def main():
     """
-    Main function that runs the complete DeepSeek-R1 pipeline.
-
-    Stages:
-    1. Gather CoT data from DeepSeek
-    2. Cold-start SFT
-    3. Reasoning-oriented RL
-    4. Rejection sampling & additional SFT
-    5. Final RL stage
-    6. Optional distillation
+    High-Level Pipeline (DeepSeek-R1 Style):
+    0. Gather CoT from DeepSeek, partially expand uncertain steps with Anthropic
+    1. Cold-Start SFT
+    2. Reasoning-Oriented RL
+    3. Rejection Sampling + Additional SFT
+    4. Final RL
+    5. Distillation (Optional)
     """
-    # Setup device
+
+    ###########################################################################
+    # Device Setup
+    ###########################################################################
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # 0) Gather chain-of-thought data from DeepSeek
-    deepseek_prompts = [
+    ###########################################################################
+    # Stage 0: Gather Data
+    ###########################################################################
+    print(
+        "\n=== Stage 0: Gather Data from DeepSeek + partial expansions from Anthropic ==="
+    )
+
+    # Here we have a few sample prompts for demonstration
+    # In a real scenario, you'd have many more prompts
+    prompts = [
         "What is 9.11 plus 9.8?",
         "Explain how to compute factorial of 5",
         "Find the derivative of x^2 + 3x - 1",
     ]
-    print("\n=== Stage 0: Gathering DeepSeek CoT Data ===")
-    cot_data = gather_cot_data_from_deepseek(deepseek_prompts, max_samples=3)
 
-    # Fallback to mock data if DeepSeek fails
-    if not cot_data:
-        print("Warning: Using fallback mock CoT data")
-        cot_data = [
+    # We'll gather a small set for demonstration. Increase max_samples for real usage.
+    partial_cot_data = gather_data_deepseek_with_partial_anthropic(
+        prompts,
+        max_samples=3,
+        deepseek_model="deepseek-reasoner",
+        anthropic_model="claude-3-5-sonnet-20241022",
+        anthropic_max_tokens=512,
+    )
+
+    if not partial_cot_data:
+        print("Warning: Using fallback mock data, as we got empty results.")
+        partial_cot_data = [
             "Question: Solve 1 + 1?\n<reasoning_process>1+1=2</reasoning_process>\n<summary>2</summary>"
         ]
 
-    # Load base model
+    ###########################################################################
+    # Load Qwen Base Model
+    ###########################################################################
     base_ckpt = "Qwen/Qwen2.5-7B-Instruct"
-    print(f"\nLoading {base_ckpt} ...")
-
+    print(f"\nLoading base model: {base_ckpt}")
     tokenizer = AutoTokenizer.from_pretrained(base_ckpt, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
@@ -859,12 +832,14 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         base_ckpt, torch_dtype="auto", device_map="auto", trust_remote_code=True
     )
-    print(f"Loaded {base_ckpt} successfully.")
+    print("Loaded base Qwen 7B Instruct model successfully.")
 
-    # 1) Cold Start SFT
-    print("\n=== Stage 1: Cold-Start SFT with DeepSeek CoT ===")
+    ###########################################################################
+    # Stage 1: Cold-Start SFT (DeepSeek-R1 pipeline approach)
+    ###########################################################################
+    print("\n=== Stage 1: Cold-Start SFT ===")
     sft_dataset = ChainOfThoughtDataset(
-        texts=cot_data, tokenizer=tokenizer, max_length=512
+        partial_cot_data, tokenizer=tokenizer, max_length=512
     )
     supervised_fine_tune(
         model,
@@ -874,20 +849,23 @@ def main():
         epochs=1,
         batch_size=2,
         lr=1e-5,
-        max_steps=30,
+        max_steps=30,  # For demonstration, limit steps
         device=device,
     )
 
-    # Reload SFT checkpoint
+    # Reload the newly fine-tuned model
     model = AutoModelForCausalLM.from_pretrained(
         "qwen_sft_ckpt", torch_dtype="auto"
     ).to(device)
 
-    # 2) Reasoning-Oriented RL
+    ###########################################################################
+    # Stage 2: Reasoning-Oriented RL
+    # This is where we replicate the "Stage 2" from the DeepSeek-R1 paper:
+    # large-scale RL focusing on tasks with clear correctness signals.
+    ###########################################################################
     print("\n=== Stage 2: Reasoning-Oriented RL ===")
     rl_dataset = MockRLReasoningDataset(tokenizer=tokenizer, num_samples=12)
     policy = GRPOTorchPolicy(model)
-
     updated_model = rl_training_grpo(
         policy_model=policy,
         tokenizer=tokenizer,
@@ -900,12 +878,15 @@ def main():
     updated_model.save_pretrained("qwen_rl_ckpt_stage2")
     tokenizer.save_pretrained("qwen_rl_ckpt_stage2")
 
-    # 3) Rejection Sampling & More SFT
+    ###########################################################################
+    # Stage 3: Rejection Sampling & Additional SFT
+    ###########################################################################
     print("\n=== Stage 3: Rejection Sampling ===")
     rl_model = AutoModelForCausalLM.from_pretrained(
         "qwen_rl_ckpt_stage2", torch_dtype="auto"
     ).to(device)
 
+    # This uses 'compute_reward()' to pick best responses
     new_data_texts = rejection_sampling_data_gen(
         rl_model,
         tokenizer,
@@ -915,7 +896,7 @@ def main():
         accept_threshold=0.5,
     )
 
-    # Additional SFT on new data
+    # Then we do a short SFT pass on that "good" data
     add_sft_dataset = AdditionalSFTDataset(new_data_texts, tokenizer)
     supervised_fine_tune(
         rl_model,
@@ -929,7 +910,9 @@ def main():
         device=device,
     )
 
-    # 4) Final RL Stage
+    ###########################################################################
+    # Stage 4: Final RL
+    ###########################################################################
     print("\n=== Stage 4: Final RL Stage ===")
     model_after_stage3 = AutoModelForCausalLM.from_pretrained(
         "qwen_sft_ckpt_stage3", torch_dtype="auto"
@@ -948,19 +931,21 @@ def main():
     final_rl_model.save_pretrained("qwen_rl_ckpt_final")
     tokenizer.save_pretrained("qwen_rl_ckpt_final")
 
-    # 5) Optional Distillation
+    ###########################################################################
+    # Stage 5: Distillation (Optional)
+    ###########################################################################
     print("\n=== Stage 5: Distillation (Optional) ===")
     teacher = AutoModelForCausalLM.from_pretrained(
         "qwen_rl_ckpt_final", torch_dtype="auto"
     ).to(device)
 
-    # Combine original CoT data and additional SFT data
-    distill_dataset_texts = cot_data + new_data_texts
+    # Combine original partial expansions data + new data from Stage 3
+    distill_dataset_texts = partial_cot_data + new_data_texts
 
     distill_reasoning(
         teacher_model=teacher,
         tokenizer=tokenizer,
-        base_student_ckpt="Qwen/Qwen2.5-7B",  # Or smaller variant
+        base_student_ckpt="Qwen/Qwen2.5-7B",  # You can pick a smaller model here
         dataset_texts=distill_dataset_texts,
         output_dir="qwen_distilled_student",
         device=device,
@@ -968,9 +953,9 @@ def main():
         lr=1e-5,
     )
 
-    print("\nAll stages completed successfully!")
-    print("Pipeline stages:")
-    print("1. Cold-Start SFT with DeepSeek CoT -> qwen_sft_ckpt/")
+    print("\nAll pipeline stages completed successfully!")
+    print("0. Partial expansions from Anthropic for uncertain steps")
+    print("1. Cold-Start SFT -> qwen_sft_ckpt/")
     print("2. Reasoning RL -> qwen_rl_ckpt_stage2/")
     print("3. Rejection Sampling + SFT -> qwen_sft_ckpt_stage3/")
     print("4. Final RL -> qwen_rl_ckpt_final/")
