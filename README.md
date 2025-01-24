@@ -1,244 +1,278 @@
 # R1 + Super CoT: ChainForge
 
-This project implements a multi-stage DeepSeek-R1–style pipeline that integrates DeepSeek Reasoner (for chain-of-thought data) with the Qwen2.5 family of large language models. It uses:
-•	Supervised Fine-Tuning (SFT) on chain-of-thought data,
-•	Reinforcement Learning (RL) with a group-based advantage approach,
-•	Rejection sampling to collect high-quality responses for a second round of SFT,
-•	A final RL pass for broad scenario coverage,
-•	Optional knowledge distillation to compress the reasoning capabilities into a smaller model.
+DeepSeek-R1 Pipeline with Qwen2.5 & DeepSeek Reasoner
+
+This repository implements a DeepSeek-R1–style multi-stage pipeline for improving the reasoning capabilities of a Qwen2.5 model, leveraging chain-of-thought (CoT) data from DeepSeek Reasoner, plus multi-stage reinforcement learning (RL). The overall approach is inspired by the DeepSeek-R1 paper:
+
+```
+DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning
+```
 
 Table of Contents
 1\.	Overview
-2\.	Features
-3\.	Prerequisites
-4\.	Project Structure
-5\.	Quickstart
-6\.	Pipeline Stages
-1\.	Chain-of-Thought Data Collection (DeepSeek)
-2\.	Cold-Start SFT
-3\.	Reasoning-Oriented RL
-4\.	Rejection Sampling & Additional SFT
-5\.	Final RL Stage
-6\.	Optional Distillation
-7\.	Hyperparameter & File Configuration
-8\.	Customization & Advanced Topics
-9\.	Performance Tips & Scaling
-10\.	Troubleshooting & Common Issues
-11\.	License
-12\.	Acknowledgments
+2\.	Project Structure
+3\.	Key Features
+4\.	Installation & Setup
+5\.	Pipeline Stages & Code Snippets
+1\.	Stage 0: Gathering CoT from DeepSeek
+2\.	Stage 1: Cold-Start SFT
+3\.	Stage-2: Reasoning-Oriented RL (GRPO)
+4\.	Stage-3: Rejection Sampling & Additional SFT
+5\.	Stage-4: Final RL Stage
+6\.	Stage-5: (Optional) Distillation
+6\.	Connecting to the DeepSeek-R1 Paper
+7\.	Hyperparameters & Customization
+8\.	Code Snippets
+9\.	Future Directions
+10\.	License
 
 Overview
 
-The DeepSeek-R1 paper introduced a powerful multi-stage pipeline to enhance reasoning capabilities in large language models (LLMs) through reinforcement learning. This repository offers a reference implementation of a similar pipeline, combining:
-•	DeepSeek Reasoner for generating chain-of-thought (CoT) data,
-•	Qwen2.5 LLMs for training and refining reasoning performance via SFT and RL,
-•	Knowledge Distillation to compress the resulting reasoning model into a smaller checkpoint.
+The DeepSeek-R1 paper introduces two models:
+•	DeepSeek-R1-Zero: A “pure RL” approach (no supervised data at start).
+•	DeepSeek-R1: A pipeline that uses “cold-start” CoT data, followed by multi-stage RL and optional distillation.
 
-It closely follows the major steps described in the DeepSeek-R1 approach, while using Qwen2.5-7B-Instruct as an example base model.
-
-Features
-•	Chain-of-thought data collection from DeepSeek Reasoner, enabling high-quality CoT for cold-start training.
-•	Reinforcement Learning (GRPO) with a reward function that measures correctness and format compliance.
-•	Rejection sampling to harvest top-quality responses, then refine the model further via SFT.
-•	Final RL pass to align the model with broader tasks and user preferences.
-•	Optional Distillation to produce a smaller model that retains advanced reasoning patterns discovered during RL.
-
-Prerequisites
-
-1. Python 3.8+
-
-While Python 3.7 might work, we recommend 3.8 or above for best compatibility with modern libraries.
-
-2. CUDA-capable GPU
-
-At least one NVIDIA GPU is highly recommended for training or RL. Multi-GPU or distributed setups are ideal for scaling.
-
-3. Dependencies
-
-Install via:
-
-pip install -r requirements.txt
-
-Within requirements.txt, make sure you have:
-•	torch>=2.0
-•	transformers>=4.37.0
-•	accelerate
-•	sentencepiece
-•	openai (for DeepSeek Reasoner)
-•	(optionally) anthropic, deepspeed, etc., if you plan further expansions.
-
-4. DeepSeek API Key
-
-Obtain an API key from DeepSeek.
-Export it as an environment variable:
-
-export DEEPSEEK\_API\_KEY="your-key-here"
-
-Alternatively, modify the code to set openai.api\_key directly.
+This repo follows the DeepSeek-R1 recipe (the “cold start” route), applying:
+1\.	Chain-of-thought data collection from DeepSeek Reasoner
+2\.	SFT on that CoT data
+3\.	Reasoning-Oriented RL (using a group-based advantage technique similar to GRPO)
+4\.	Rejection sampling to collect only the best RL outputs, then more SFT
+5\.	A final RL pass
+6\.	(Optionally) distill the final model into a smaller Qwen2.5 checkpoint
 
 Project Structure
 
 .
-├── deepseek\_qwen2\_5\_integration\_r1.py   # Main pipeline script
-├── requirements.txt                     # Python dependencies
+├── deepseek\_qwen2\_5\_integration\_r1.py   # Main pipeline code
+├── requirements.txt                     # Dependencies
 └── README.md                            # This README
 
 ```
-•	deepseek_qwen2_5_integration_r1.py
+•	deepseek_qwen2_5_integration_r1.py: Contains:
+•	A function to gather CoT from DeepSeek Reasoner
+•	A ChainOfThoughtDataset class for SFT
+•	A small MockRLReasoningDataset for toy RL tasks
+•	GRPOTorchPolicy for group-based RL updates
+•	Functions for rejection sampling and distillation
+•	A main() function orchestrating the entire pipeline
 ```
 
-Contains all the logic for:
-1\.	Gathering chain-of-thought data from DeepSeek Reasoner
-2\.	Cold-start SFT on that data
-3\.	Reinforcement Learning with a toy “Group Relative Policy Optimization” approach
-4\.	Rejection sampling to refine SFT data
-5\.	A final RL pass
-6\.	Optional distillation to a smaller model
+Key Features
+1\.	Chain-of-Thought (CoT) Integration
+•	Calls the DeepSeek Reasoner API, retrieving reasoning\_content and final content fields.
+2\.	Multi-Stage RL (GRPO)
+•	Uses a simplified PPO-like approach with group advantage.
+3\.	Rejection Sampling
+•	Filters out suboptimal RL completions for better SFT data.
+4\.	Distillation
+•	Compresses the final model’s reasoning capability into a smaller checkpoint.
+5\.	Faithful to DeepSeek-R1
+•	Reflects the 4-step pipeline of cold-start data, RL, rejection sampling, final RL, and optional distillation.
 
-Quickstart
-1\.	Install dependencies
+Installation & Setup
+1\.	Install Dependencies
 
 pip install -r requirements.txt
 
-```
-2.	Set the DeepSeek API key
-```
-
-export DEEPSEEK\_API\_KEY="your-key-here"
+Make sure transformers>=4.37.0 for Qwen2.5, plus openai for the DeepSeek Reasoner API, and torch with GPU support.
 
 ```
-3.	Run the pipeline
+2.	Set DeepSeek API Key
+```
+
+export DEEPSEEK\_API\_KEY="your-deepseek-api-key"
+
+Or modify the code to set openai.api\_key directly.
+
+```
+3.	Run the Pipeline
 ```
 
 python deepseek\_qwen2\_5\_integration\_r1.py
 
+Checkpoints are saved to local folders (e.g., qwen\_sft\_ckpt/, qwen\_rl\_ckpt\_stage2/, etc.).
+
+Pipeline Stages & Code Snippets
+
+Stage 0: Gathering CoT from DeepSeek
+
+Goal: Retrieve chain-of-thought for “cold-start” SFT.
+
+Code (gather\_cot\_data\_from\_deepseek):
+
+def gather\_cot\_data\_from\_deepseek(prompts, max\_samples=10, model\_name="deepseek-reasoner"):
+"""
+Calls DeepSeek Reasoner for each prompt, extracts reasoning\_content + content,
+and formats them into a single text block for SFT.
+"""
+openai.api\_key = ...
+openai.api\_base = "https://api.deepseek.com"
+...
+for user\_prompt in prompts:
+response = openai.ChatCompletion.create(...)
+reasoning\_cot = response.choices\[0].message.reasoning\_content
+final\_answer = response.choices\[0].message.content
+\# Merge
+single\_text = f"Question: {user\_prompt}\n\<reasoning\_process>{reasoning\_cot}\</reasoning\_process>\n<summary>{final\_answer}</summary>"
+results.append(single\_text)
+return results
+
+Stage 1: Cold-Start SFT
+
+Goal: Use that newly gathered CoT to fine-tune Qwen2.5 so it learns to produce reasoning + final answer.
+
+Code snippet from ChainOfThoughtDataset + supervised\_fine\_tune:
+
+class ChainOfThoughtDataset(Dataset):
+\# Holds the CoT text examples from DeepSeek Reasoner
+\# Tokenized in collate\_fn
+...
+
+def supervised\_fine\_tune(model, tokenizer, train\_dataset, ...):
+"""
+Standard teacher-forcing next-token prediction on chain-of-thought data.
+Saves to output\_dir.
+"""
+...
+model.save\_pretrained(output\_dir)
+tokenizer.save\_pretrained(output\_dir)
+
+Stage 2: Reasoning-Oriented RL (GRPO)
+
+Goal: Further refine the model for correctness, clarity of reasoning, etc.
+•	We define a MockRLReasoningDataset with a trivial question-answer format for demonstration.
+•	Use a GRPOTorchPolicy wrapper to compute log probabilities.
+•	Reward = correctness + CoT formatting.
+
+Code snippet from rl\_training\_grpo:
+
+def rl\_training\_grpo(
+policy\_model, tokenizer, rl\_dataset, num\_rl\_steps=50, group\_size=4, ...
+):
+"""
+Conducts group-based RL. For each question, sample multiple responses,
+compute reward, then update the policy with a clipped objective + KL penalty.
+"""
+\# 1) Sample responses
+\# 2) Compute advantage from group rewards
+\# 3) Update policy step by step
+...
+return policy\_model.model
+
+Stage 3: Rejection Sampling & Additional SFT
+
+Goal: Gather the best RL completions by reward, convert them into new training examples, and do a second SFT pass.
+
+Code snippet from rejection\_sampling\_data\_gen:
+
+def rejection\_sampling\_data\_gen(rl\_model, tokenizer, dataset, ...):
+"""
+For each dataset item, sample multiple completions,
+pick the highest-reward, and store if above threshold.
+"""
+new\_data = \[]
+for item in dataset:
+candidates = sample\_responses(...)
+\# Evaluate reward
+\# Keep best if reward >= accept\_threshold
+return new\_data
+
+We then load that new data into an AdditionalSFTDataset, and call supervised\_fine\_tune again to produce qwen\_sft\_ckpt\_stage3.
+
+Stage 4: Final RL Stage
+
+Goal: Another RL pass for broader coverage of prompts/scenarios.
+
+Code snippet:
+
+# Reload updated model
+
+model\_after\_stage3 = AutoModelForCausalLM.from\_pretrained("qwen\_sft\_ckpt\_stage3", ...)
+policy2 = GRPOTorchPolicy(model\_after\_stage3)
+final\_rl\_model = rl\_training\_grpo(..., policy\_model=policy2, ...)
+final\_rl\_model.save\_pretrained("qwen\_rl\_ckpt\_final")
+
+Stage 5: (Optional) Distillation
+
+Goal: Distill the final RL model into a smaller Qwen2.5.
+
+Code snippet from distill\_reasoning:
+
+def distill\_reasoning(
+teacher\_model, tokenizer, base\_student\_ckpt="Qwen/Qwen2.5-7B", dataset\_texts=None, ...
+):
+"""
+1\. Load the smaller student model
+2\. Generate teacher outputs on the dataset
+3\. SFT the student to replicate them
+4\. Save final distilled checkpoint
+"""
+...
+
+Connecting to the DeepSeek-R1 Paper
+1\.	Cold Start Data vs. RL: The pipeline follows DeepSeek-R1’s practice of acquiring a small set of high-quality chain-of-thought data first, rather than starting from scratch (DeepSeek-R1-Zero).
+2\.	Multi-Stage RL: Mirroring the two RL phases described (reasoning-oriented RL + RL for all scenarios).
+3\.	Rejection Sampling: Exactly aligns with the paper’s approach to gather new SFT data from the model’s best RL outputs.
+4\.	Distillation: The final step in the paper, providing smaller “DeepSeek-R1-Distill” models. Here, we similarly compress the final RL model into a smaller Qwen2.5 checkpoint.
+
+Hence, the code is inspired by and consistent with the DeepSeek-R1 pipeline described in the paper—albeit scaled down for demonstration.
+
+Hyperparameters & Customization
+•	num\_rl\_steps: More steps yield better RL coverage (the paper used thousands).
+•	group\_size: Increase to produce more candidate completions per prompt, better advantage estimation.
+•	clip\_ratio + kl\_coeff: Control how strictly we penalize the policy for deviating from the reference.
+•	compute\_reward: You can expand it to compile code solutions, parse numeric results carefully, or even use a neural reward model.
+
+Code Snippets
+
+Below are some salient code blocks from deepseek\_qwen2\_5\_integration\_r1.py:
+1\.	Gathering CoT:
+
+# Stage 0: Retrieve chain-of-thought from DeepSeek
+
+deepseek\_prompts = \[
+"What is 9.11 plus 9.8?",
+"Explain how to compute factorial of 5",
+...
+]
+cot\_data = gather\_cot\_data\_from\_deepseek(deepseek\_prompts, max\_samples=3)
+
 ```
-4.	Checkpoints
-•	After each major stage, new checkpoints get saved to local directories (qwen_sft_ckpt/, qwen_rl_ckpt_stage2/, etc.).
+2.	RL updates:
 ```
 
-Pipeline Stages
+# Partial snippet from rl\_training\_grpo
 
-1. DeepSeek CoT Data Collection
-   •	What: Calls the DeepSeek Reasoner API to gather chain-of-thought plus short final answers for a set of user prompts.
-   •	Why: This provides the “cold start” data (chain-of-thought labeled examples) for initial SFT, enabling the model to generate more interpretable reasoning.
-   •	Implementation:
+ratio = torch.exp(pol\_lp - ref\_lp)
+surr1 = ratio \* adv
+surr2 = torch.clamp(ratio, 1.0 - clip\_ratio, 1.0 + clip\_ratio) \* adv
+policy\_loss = -torch.min(surr1, surr2)
+kl\_penalty = kl\_coeff \* (pol\_lp - ref\_lp)
+total\_loss = policy\_loss + kl\_penalty
 
-def gather\_cot\_data\_from\_deepseek(prompts, ...):
-\# uses openai.ChatCompletion with model="deepseek-reasoner"
-\# extracts reasoning\_content and content
-\# merges them into a single training sample
-return samples
+```
+3.	Distillation:
+```
 
-2. Cold-Start SFT
-   •	What: Perform supervised fine-tuning on the chain-of-thought data from Step 1.
-   •	How: We treat each “prompt + \<reasoning\_process>… + ” as a single sequence. Then do standard next-token prediction with cross-entropy.
-   •	Checkpoint: Saved to qwen\_sft\_ckpt/.
+# Distill final RL model into a smaller Qwen2.5
 
-3. Reasoning-Oriented RL
-   •	What: Use a GRPO-like approach (Group-based Reward Policy Optimization) to further refine the model specifically for correctness and format.
-   •	Reward:
-   •	+1 if the final text contains the correct answer string (for toy tasks).
-   •	+0.2 if the text includes \<reasoning\_process> and <summary> tags.
-   •	Implementation:
-   1. Sample multiple responses for each prompt in a “group.”
-   2. Evaluate reward for each response.
-   3. Compute advantage via group-based normalization.
-   4. Update the model to maximize advantage while applying a KL penalty vs. a reference.
-      •	Checkpoint: qwen\_rl\_ckpt\_stage2/.
+teacher = AutoModelForCausalLM.from\_pretrained("qwen\_rl\_ckpt\_final", ...)
+distill\_reasoning(
+teacher\_model=teacher,
+tokenizer=tokenizer,
+base\_student\_ckpt="Qwen/Qwen2.5-3B",  # e.g., smaller
+dataset\_texts=distill\_dataset\_texts,
+...
+)
 
-4. Rejection Sampling & Additional SFT
-   •	What:
-   1. Use the RL model from Step 3 to generate multiple completions.
-   2. Filter for best responses by reward threshold.
-   3. Perform a second SFT pass on this curated data for additional improvement.
-      •	Checkpoint: qwen\_sft\_ckpt\_stage3/.
-
-5. Final RL Stage
-   •	What: Another RL pass that includes a broader set of prompts or tasks—beyond the strictly numerical reasoning tasks (e.g., general questions, knowledge, writing tasks, etc.).
-   •	Why: This broadens alignment and ensures the model can handle different user queries gracefully.
-   •	Checkpoint: qwen\_rl\_ckpt\_final/.
-
-6. Optional Distillation
-   •	What: Distill the final RL model into a smaller Qwen2.5 checkpoint (e.g., 3B or 1B).
-   •	Why: Gains in reasoning from RL can be compressed into a smaller model for efficiency.
-   •	Checkpoint: qwen\_distilled\_student/.
-
-Hyperparameter & File Configuration
-
-Check out the top-level constants or function parameters inside deepseek\_qwen2\_5\_integration\_r1.py:
-•	num\_rl\_steps: total RL optimization steps (the larger, the better—real usage might need thousands).
-•	group\_size: how many samples we generate for each prompt to estimate advantage.
-•	clip\_ratio, kl\_coeff: PPO/GRPO hyperparameters controlling policy updates.
-•	SFT training arguments (batch size, learning rate, epochs, max\_steps).
-
-You can also adjust:
-•	deepseek\_prompts: the set of prompts we feed to DeepSeek Reasoner to gather chain-of-thought data.
-•	MockRLReasoningDataset: a placeholder for your real RL tasks (math, code, or knowledge).
-
-Customization & Advanced Topics
-1\.	Reward Functions
-•	The toy example uses a naive reward (presence of ground-truth string).
-•	In practice, you might compile code, parse numeric results, or call specialized validators.
-2\.	Data Scaling
-•	Replace the small, toy prompts with large volumes of domain-specific data (math, coding, knowledge).
-•	Use chunked reading if your data is extremely large.
-3\.	Distributed/Accelerated Training
-•	For serious usage, integrate Deepspeed or Accelerate for multi-GPU, multi-node setups.
-•	Consider parameter-efficient fine-tuning methods (LoRA, QLoRA) to reduce memory overhead.
-4\.	Multi-Turn Conversation
-•	If your tasks require multiple rounds of user messages, adapt the prompt format and memory of past messages.
-•	But be sure to remove the chain-of-thought from the conversation context before calling DeepSeek again, to avoid 400 errors.
-5\.	Evaluation
-•	Integrate standard evaluation scripts (MMLU, CodeBench, etc.) at each stage to measure improvements.
-
-Performance Tips & Scaling
-•	GPU Requirements: Qwen2.5-7B requires a significant amount of GPU VRAM (≥ 15GB). For large-scale RL, more GPUs or distributed training is recommended.
-•	Batch Size: Start small (batch size 2 or 4) if limited by GPU memory. Expand if you can.
-•	Precision: Use FP16 or BF16 to reduce memory usage. If using accelerate or deepspeed, you can explore 8-bit or 4-bit quantization approaches.
-•	Checkpoints: The pipeline saves multiple checkpoints (SFT, RL, final). Each can be quite large. Make sure you have enough storage and handle checkpoint versioning carefully.
-
-Troubleshooting & Common Issues
-1\.	CUDA Out of Memory
-•	Lower your batch size or reduce sequence length.
-•	Use parameter-efficient fine-tuning or 8-bit modes.
-2\.	400 Error from DeepSeek
-•	Ensure you remove the reasoning\_content from prior calls when building new messages.
-3\.	No Improvement in RL
-•	Check your reward function. If it’s too lenient or too strict, training might not converge.
-•	Verify that the KL penalty or clip ratio is not too high or too low.
-4\.	Slow Inference
-•	Large models are slow by default; consider smaller Qwen2.5 variants or distillation.
-5\.	KeyError / TrustRemoteCode
-•	Make sure transformers>=4.37.0 and trust\_remote\_code=True are set for Qwen.
+Future Directions
+•	Full Scale Datasets: Replace the toy MockRLReasoningDataset with real math/coding tasks.
+•	Distributed Training: For large-scale RL, consider accelerate, Deepspeed, or Colossal-AI.
+•	Advanced Reward Modeling: Combine rule-based correctness checks with a preference model for style, helpfulness, etc.
+•	Multi-Turn: If you want multi-turn or chat-based tasks, track conversation context carefully and avoid re-feeding chain-of-thought to DeepSeek.
 
 License
 
-All code in this repository is released under the MIT License (unless otherwise noted).
-See LICENSE for details.
+This code is released under the MIT License. See LICENSE file for details.
 
-Acknowledgments
-•	DeepSeek: for providing the chain-of-thought Reasoner API and the original DeepSeek-R1 methodology.
-•	Qwen Team: for developing and open-sourcing Qwen2.5 models, enabling advanced training workflows.
-•	Open-source Community: libraries like Transformers, Accelerate, etc., which make large-scale LLM training feasible.
-
-If you find this work helpful, please consider citing relevant references:
-
-@misc{qwen2.5,
-title = {Qwen2.5: A Party of Foundation Models},
-url = {https://qwenlm.github.io/blog/qwen2.5/},
-author = {Qwen Team},
-month = {September},
-year = {2024}
-}
-
-@misc{deepseekr1,
-title={DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning},
-author={DeepSeek-AI Team},
-year={2024},
-howpublished={arXiv preprint arXiv:...}
-}
-
-Feel free to open issues or pull requests if you encounter any problems or would like to contribute improvements!
-
-Happy reasoning!
+Enjoy exploring DeepSeek-R1–style reinforcement learning with Qwen2.5! If you find this helpful, please cite the DeepSeek-R1 paper and the Qwen2.5 docs. Feel free to open an issue or PR with improvements or suggestions!
