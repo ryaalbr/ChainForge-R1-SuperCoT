@@ -819,104 +819,13 @@ def main():
         partial_cot_data = [
             "Question: Solve 1 + 1?\n<reasoning_process>1+1=2</reasoning_process>\n<summary>2</summary>"
         ]
-
-    ###########################################################################
-    # Load Qwen Base Model
-    ###########################################################################
-    base_ckpt = "Qwen/Qwen2.5-7B-Instruct"
-    print(f"\nLoading base model: {base_ckpt}")
-    tokenizer = AutoTokenizer.from_pretrained(base_ckpt, trust_remote_code=True)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-
-    model = AutoModelForCausalLM.from_pretrained(
-        base_ckpt, torch_dtype="auto", device_map="auto", trust_remote_code=True
-    )
-    print("Loaded base Qwen 7B Instruct model successfully.")
-
-    ###########################################################################
-    # Stage 1: Cold-Start SFT (DeepSeek-R1 pipeline approach)
-    ###########################################################################
-    print("\n=== Stage 1: Cold-Start SFT ===")
-    sft_dataset = ChainOfThoughtDataset(
-        partial_cot_data, tokenizer=tokenizer, max_length=512
-    )
-    supervised_fine_tune(
-        model,
-        tokenizer,
-        sft_dataset,
-        output_dir="qwen_sft_ckpt",
-        epochs=1,
-        batch_size=2,
-        lr=1e-5,
-        max_steps=30,  # For demonstration, limit steps
-        device=device,
-    )
-
-    # Reload the newly fine-tuned model
-    model = AutoModelForCausalLM.from_pretrained(
-        "qwen_sft_ckpt", torch_dtype="auto"
-    ).to(device)
-
-    ###########################################################################
-    # Stage 2: Reasoning-Oriented RL
-    # This is where we replicate the "Stage 2" from the DeepSeek-R1 paper:
-    # large-scale RL focusing on tasks with clear correctness signals.
-    ###########################################################################
-    print("\n=== Stage 2: Reasoning-Oriented RL ===")
-    rl_dataset = MockRLReasoningDataset(tokenizer=tokenizer, num_samples=12)
-    policy = GRPOTorchPolicy(model)
-    updated_model = rl_training_grpo(
-        policy_model=policy,
-        tokenizer=tokenizer,
-        rl_dataset=rl_dataset,
-        num_rl_steps=30,
-        group_size=4,
-        device=device,
-        lr=1e-6,
-    )
-    updated_model.save_pretrained("qwen_rl_ckpt_stage2")
-    tokenizer.save_pretrained("qwen_rl_ckpt_stage2")
-
-    ###########################################################################
-    # Stage 3: Rejection Sampling & Additional SFT
-    ###########################################################################
-    print("\n=== Stage 3: Rejection Sampling ===")
-    rl_model = AutoModelForCausalLM.from_pretrained(
-        "qwen_rl_ckpt_stage2", torch_dtype="auto"
-    ).to(device)
-
-    # This uses 'compute_reward()' to pick best responses
-    new_data_texts = rejection_sampling_data_gen(
-        rl_model,
-        tokenizer,
-        rl_dataset,
-        device=device,
-        num_samples=4,
-        accept_threshold=0.5,
-    )
-
-    # Then we do a short SFT pass on that "good" data
-    add_sft_dataset = AdditionalSFTDataset(new_data_texts, tokenizer)
-    supervised_fine_tune(
-        rl_model,
-        tokenizer,
-        add_sft_dataset,
-        output_dir="qwen_sft_ckpt_stage3",
-        epochs=1,
-        batch_size=2,
-        lr=1e-5,
-        max_steps=20,
-        device=device,
-    )
-
+		
     ###########################################################################
     # Stage 4: Final RL
     ###########################################################################
     print("\n=== Stage 4: Final RL Stage ===")
-    model_after_stage3 = AutoModelForCausalLM.from_pretrained(
-        "qwen_sft_ckpt_stage3", torch_dtype="auto"
-    ).to(device)
+    model_after_stage3 = AutoModelForCausalLM.from_pretrained("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B").to(device)
+	rl_dataset = MockRLReasoningDataset(tokenizer=tokenizer, num_samples=12)
 
     policy2 = GRPOTorchPolicy(model_after_stage3)
     final_rl_model = rl_training_grpo(
@@ -930,28 +839,6 @@ def main():
     )
     final_rl_model.save_pretrained("qwen_rl_ckpt_final")
     tokenizer.save_pretrained("qwen_rl_ckpt_final")
-
-    ###########################################################################
-    # Stage 5: Distillation (Optional)
-    ###########################################################################
-    print("\n=== Stage 5: Distillation (Optional) ===")
-    teacher = AutoModelForCausalLM.from_pretrained(
-        "qwen_rl_ckpt_final", torch_dtype="auto"
-    ).to(device)
-
-    # Combine original partial expansions data + new data from Stage 3
-    distill_dataset_texts = partial_cot_data + new_data_texts
-
-    distill_reasoning(
-        teacher_model=teacher,
-        tokenizer=tokenizer,
-        base_student_ckpt="Qwen/Qwen2.5-7B",  # You can pick a smaller model here
-        dataset_texts=distill_dataset_texts,
-        output_dir="qwen_distilled_student",
-        device=device,
-        epochs=1,
-        lr=1e-5,
-    )
 
     print("\nAll pipeline stages completed successfully!")
     print("0. Partial expansions from Anthropic for uncertain steps")
